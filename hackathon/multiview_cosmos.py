@@ -237,7 +237,7 @@ class MultiviewCosmosWrapper(nn.Module):
     
     def __init__(
         self,
-        model_name: str = 'nvidia/Cosmos-Predict2.5-2B',
+        model_name: str = 'nvidia/Cosmos-Predict2-2B-Video2World',
         num_views: int = 2,
         view_embed_dim: int = 7,
         lora_r: int = 8,
@@ -277,10 +277,8 @@ class MultiviewCosmosWrapper(nn.Module):
         
     def _load_pretrained(self, model_name: str):
         """Load pretrained Cosmos model components."""
-        from diffusers import CosmosVideoToWorldPipeline
-        
         print(f"Loading pretrained model: {model_name}")
-        DiffusionPipeline.from_pretrained("nvidia/Cosmos-Predict2.5-2B", dtype=torch.bfloat16, device_map="cuda")
+        pipeline = DiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.bfloat16)
         
         self.vae = pipeline.vae
         self.transformer = pipeline.transformer

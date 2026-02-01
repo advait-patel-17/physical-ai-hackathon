@@ -797,6 +797,9 @@ ffmpeg = [
     { name = "imageio-ffmpeg" },
     { name = "psutil" },
 ]
+pyav = [
+    { name = "av" },
+]
 
 [[package]]
 name = "imageio-ffmpeg"
@@ -1513,18 +1516,26 @@ name = "physical-ai-hackathon"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "accelerate" },
+    { name = "imageio", extra = ["pyav"] },
     { name = "lerobot", extra = ["dynamixel"] },
     { name = "mimic-video" },
     { name = "numpy" },
+    { name = "peft" },
     { name = "pytest" },
+    { name = "wandb" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate", specifier = ">=1.0.0" },
+    { name = "imageio", extras = ["pyav"], specifier = ">=2.34.0" },
     { name = "lerobot", extras = ["dynamixel"], specifier = ">=0.4.3" },
     { name = "mimic-video", specifier = ">=0.0.47" },
     { name = "numpy", specifier = ">=2.4.2" },
+    { name = "peft", specifier = ">=0.10.0" },
     { name = "pytest", specifier = ">=9.0.2" },
+    { name = "wandb", specifier = ">=0.17.0" },
 ]
 
 [[package]]
