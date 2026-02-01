@@ -296,10 +296,10 @@ class MultiviewCosmosWrapper(nn.Module):
             model_name, subfolder="tokenizer"
         )
         
-        # Store VAE config
-        self.vae_temporal_compression = self.vae.config.temporal_compression_ratio
-        self.vae_spatial_compression = self.vae.config.spatial_compression_ratio
-        self.latent_channels = self.vae.config.latent_channels
+        # Store VAE config (AutoencoderKLWan uses different attribute names)
+        self.vae_temporal_compression = self.vae.config.scale_factor_temporal
+        self.vae_spatial_compression = self.vae.config.scale_factor_spatial
+        self.latent_channels = self.vae.config.z_dim
         
         # Replace transformer's RoPE with per-view version
         # This ensures RoPE positions reset for each view instead of being continuous
