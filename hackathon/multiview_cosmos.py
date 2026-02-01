@@ -521,6 +521,113 @@ class MultiviewCosmosWrapper(nn.Module):
         
         return loss
     
+    @torch.no_grad()
+    def generate(
+        self,
+        front_context: Tensor,
+        wrist_context: Tensor,
+        prompts: List[str],
+        num_inference_steps: int = 10,
+        num_frames_to_generate: int = 5,
+    ) -> Tuple[Tensor, Tensor]:
+        """Generate future frames using flow matching sampling.
+        
+        Args:
+            front_context: Front camera context frames (B, T_ctx, C, H, W) in [0, 1]
+            wrist_context: Wrist camera context frames (B, T_ctx, C, H, W) in [0, 1]
+            prompts: List of text prompts
+            num_inference_steps: Number of ODE integration steps (more = better quality)
+            num_frames_to_generate: Number of future frames to generate per view
+            
+        Returns:
+            Tuple of (front_generated, wrist_generated) both (B, T_gen, C, H, W) in [0, 1]
+        """
+        B = front_context.shape[0]
+        device = front_context.device
+        
+        # Encode text
+        text_embeds = self.encode_text(prompts)
+        
+        # Encode context frames to latent
+        front_ctx_latent = self.encode_video(front_context)  # (B, C_lat, T'_ctx, H', W')
+        wrist_ctx_latent = self.encode_video(wrist_context)
+        
+        _, C_lat, T_ctx_lat, H_lat, W_lat = front_ctx_latent.shape
+        
+        # Compute number of latent frames to generate
+        # Temporal compression = 8 for Cosmos VAE
+        T_gen_lat = num_frames_to_generate // self.vae_temporal_compression
+        T_gen_lat = max(1, T_gen_lat)
+        
+        # Initialize future latent frames with pure noise
+        front_future_latent = torch.randn(B, C_lat, T_gen_lat, H_lat, W_lat, device=device, dtype=front_ctx_latent.dtype)
+        wrist_future_latent = torch.randn(B, C_lat, T_gen_lat, H_lat, W_lat, device=device, dtype=wrist_ctx_latent.dtype)
+        
+        # Add view embeddings to context
+        front_ctx_with_emb = self.view_embedding(front_ctx_latent, view_idx=0)
+        wrist_ctx_with_emb = self.view_embedding(wrist_ctx_latent, view_idx=1)
+        
+        # Flow matching ODE integration: t goes from 1 (noise) to 0 (data)
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+        
+        for i in range(num_inference_steps):
+            t_current = timesteps[i]
+            t_next = timesteps[i + 1]
+            dt = t_next - t_current  # Negative (going from 1 to 0)
+            
+            # Add view embeddings to current future latents
+            front_future_with_emb = self.view_embedding(front_future_latent, view_idx=0)
+            wrist_future_with_emb = self.view_embedding(wrist_future_latent, view_idx=1)
+            
+            # Concatenate context + future along temporal dimension
+            front_full = torch.cat([front_ctx_with_emb, front_future_with_emb], dim=2)
+            wrist_full = torch.cat([wrist_ctx_with_emb, wrist_future_with_emb], dim=2)
+            
+            # Concatenate views along temporal dimension
+            multiview_latent = torch.cat([front_full, wrist_full], dim=2)
+            
+            # Create timestep tensor: context at t=0 (clean), future at t_current
+            T_total = multiview_latent.shape[2]
+            T_ctx = front_ctx_with_emb.shape[2]
+            T_future = front_future_with_emb.shape[2]
+            
+            # Build per-frame timesteps
+            timestep_tensor = torch.zeros(B, T_total, device=device, dtype=multiview_latent.dtype)
+            # Future frames of view 1: T_ctx to T_ctx + T_future
+            timestep_tensor[:, T_ctx:T_ctx + T_future] = t_current
+            # Future frames of view 2: T_ctx + T_future + T_ctx to end
+            timestep_tensor[:, T_ctx + T_future + T_ctx:] = t_current
+            
+            # Predict flow
+            pred_flow = self.forward_transformer(
+                multiview_latent,
+                timestep_tensor[:, 0],  # Scalar timestep for now (simplified)
+                text_embeds,
+            )
+            
+            # Extract predicted flow for future frames only
+            # View 1 future: positions T_ctx to T_ctx + T_future
+            # View 2 future: positions T_ctx + T_future + T_ctx to end
+            C_with_emb = front_ctx_with_emb.shape[1]
+            
+            front_future_flow = pred_flow[:, :C_with_emb, T_ctx:T_ctx + T_future, :, :]
+            wrist_future_flow = pred_flow[:, :C_with_emb, T_ctx + T_future + T_ctx:, :, :]
+            
+            # Remove view embedding channels from flow (keep only latent channels)
+            front_future_flow = front_future_flow[:, :C_lat, :, :, :]
+            wrist_future_flow = wrist_future_flow[:, :C_lat, :, :, :]
+            
+            # Euler step: x_next = x_current + dt * flow
+            # dt is negative, and flow points from noise to data
+            front_future_latent = front_future_latent + dt * front_future_flow
+            wrist_future_latent = wrist_future_latent + dt * wrist_future_flow
+        
+        # Decode generated latents to pixels
+        front_generated = self.decode_latent(front_future_latent)  # (B, T_gen, C, H, W)
+        wrist_generated = self.decode_latent(wrist_future_latent)
+        
+        return front_generated, wrist_generated
+    
     def save_checkpoint(self, path: str, step: int):
         """Save model checkpoint including LoRA weights and view embeddings.
         

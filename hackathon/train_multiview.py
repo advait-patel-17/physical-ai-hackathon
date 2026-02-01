@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+# !/usr/bin/env python
 """
 Multiview Video Backbone Finetuning Script.
 
@@ -35,11 +35,13 @@ import argparse
 import os
 import math
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
+import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.tensorboard import SummaryWriter
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm.auto import tqdm
@@ -95,6 +97,193 @@ def get_cosine_schedule_with_warmup(
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
     
     return LambdaLR(optimizer, lr_lambda)
+
+
+def save_video_to_disk(
+    video: torch.Tensor,
+    path: str,
+    fps: int = 8,
+):
+    """Save video tensor to MP4 file.
+    
+    Args:
+        video: Video tensor (T, C, H, W) in [0, 1]
+        path: Output path for MP4 file
+        fps: Frames per second
+    """
+    try:
+        import imageio.v3 as iio
+    except ImportError:
+        import imageio as iio
+    
+    # Convert to numpy uint8: (T, C, H, W) -> (T, H, W, C)
+    video_np = video.permute(0, 2, 3, 1).cpu().numpy()
+    video_np = (video_np * 255).clip(0, 255).astype(np.uint8)
+    
+    # Save video
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    iio.imwrite(path, video_np, fps=fps)
+
+
+def create_comparison_grid(
+    gt_video: torch.Tensor,
+    gen_video: torch.Tensor,
+) -> torch.Tensor:
+    """Create side-by-side comparison grid of GT and generated video.
+    
+    Args:
+        gt_video: Ground truth video (T, C, H, W)
+        gen_video: Generated video (T_gen, C, H, W)
+        
+    Returns:
+        Grid video (T, C, H, W*2) with GT on left, generated on right
+    """
+    T_gt, C, H, W = gt_video.shape
+    T_gen = gen_video.shape[0]
+    
+    # Use minimum of the two lengths
+    T = min(T_gt, T_gen)
+    
+    # Concatenate horizontally
+    grid = torch.cat([gt_video[:T], gen_video[:T]], dim=3)  # (T, C, H, W*2)
+    
+    return grid
+
+
+@torch.no_grad()
+def run_evaluation(
+    model,
+    val_dataloader,
+    accelerator: Accelerator,
+    global_step: int,
+    output_dir: str,
+    num_samples: int = 4,
+    num_val_batches: int = 10,
+    num_inference_steps: int = 10,
+):
+    """Run validation and generate sample videos.
+    
+    Args:
+        model: The model (may be wrapped by accelerator)
+        val_dataloader: Validation dataloader
+        accelerator: Accelerator instance
+        global_step: Current training step
+        output_dir: Directory to save samples
+        num_samples: Number of samples to generate
+        num_val_batches: Number of batches for validation loss
+        num_inference_steps: Number of inference steps for generation
+        
+    Returns:
+        Dictionary with val_loss and paths to saved samples
+    """
+    model.eval()
+    unwrapped_model = accelerator.unwrap_model(model)
+    
+    # Compute validation loss
+    val_losses = []
+    val_iter = iter(val_dataloader)
+    
+    for _ in range(min(num_val_batches, len(val_dataloader))):
+        try:
+            front_videos, wrist_videos, prompts = next(val_iter)
+        except StopIteration:
+            break
+        
+        front_videos = front_videos.to(accelerator.device)
+        wrist_videos = wrist_videos.to(accelerator.device)
+        
+        loss = unwrapped_model.compute_flow_loss(front_videos, wrist_videos, prompts)
+        val_losses.append(loss.item())
+    
+    avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0.0
+    
+    # Generate sample videos
+    samples_dir = os.path.join(output_dir, "samples", f"step_{global_step}")
+    os.makedirs(samples_dir, exist_ok=True)
+    
+    # Get a few samples from validation set
+    val_iter = iter(val_dataloader)
+    generated_samples = []
+    
+    for sample_idx in range(num_samples):
+        try:
+            front_videos, wrist_videos, prompts = next(val_iter)
+        except StopIteration:
+            break
+        
+        # Take first item from batch
+        front_video = front_videos[0:1].to(accelerator.device)  # (1, T, C, H, W)
+        wrist_video = wrist_videos[0:1].to(accelerator.device)
+        prompt = [prompts[0]]
+        
+        # Split into context and future
+        T = front_video.shape[1]
+        T_ctx = T // 2  # Use first half as context
+        T_future = T - T_ctx
+        
+        front_context = front_video[:, :T_ctx]
+        wrist_context = wrist_video[:, :T_ctx]
+        front_future_gt = front_video[:, T_ctx:]
+        wrist_future_gt = wrist_video[:, T_ctx:]
+        
+        # Generate future frames
+        try:
+            front_gen, wrist_gen = unwrapped_model.generate(
+                front_context,
+                wrist_context,
+                prompt,
+                num_inference_steps=num_inference_steps,
+                num_frames_to_generate=T_future * 8,  # Account for temporal compression
+            )
+        except Exception as e:
+            print(f"Generation failed for sample {sample_idx}: {e}")
+            continue
+        
+        # Save videos to disk
+        # Front camera
+        front_gt_path = os.path.join(samples_dir, f"sample_{sample_idx}_front_gt.mp4")
+        front_gen_path = os.path.join(samples_dir, f"sample_{sample_idx}_front_gen.mp4")
+        save_video_to_disk(front_future_gt[0], front_gt_path)
+        save_video_to_disk(front_gen[0], front_gen_path)
+        
+        # Wrist camera
+        wrist_gt_path = os.path.join(samples_dir, f"sample_{sample_idx}_wrist_gt.mp4")
+        wrist_gen_path = os.path.join(samples_dir, f"sample_{sample_idx}_wrist_gen.mp4")
+        save_video_to_disk(wrist_future_gt[0], wrist_gt_path)
+        save_video_to_disk(wrist_gen[0], wrist_gen_path)
+        
+        generated_samples.append({
+            "front_gt": front_future_gt[0],
+            "front_gen": front_gen[0],
+            "wrist_gt": wrist_future_gt[0],
+            "wrist_gen": wrist_gen[0],
+            "prompt": prompt[0],
+        })
+        
+        if accelerator.is_main_process:
+            print(f"  Saved sample {sample_idx}: {prompt[0][:50]}...")
+    
+    # Log to TensorBoard
+    if accelerator.is_main_process and generated_samples:
+        # Log videos as image grids (TensorBoard video logging)
+        for idx, sample in enumerate(generated_samples):
+            # Create comparison grids
+            front_grid = create_comparison_grid(sample["front_gt"], sample["front_gen"])
+            wrist_grid = create_comparison_grid(sample["wrist_gt"], sample["wrist_gen"])
+            
+            # Log to accelerator tracker
+            accelerator.log({
+                f"samples/front_{idx}": front_grid.unsqueeze(0),  # Add batch dim
+                f"samples/wrist_{idx}": wrist_grid.unsqueeze(0),
+            }, step=global_step)
+    
+    model.train()
+    
+    return {
+        "val_loss": avg_val_loss,
+        "samples_dir": samples_dir,
+        "num_samples": len(generated_samples),
+    }
 
 
 def parse_args():
@@ -215,6 +404,18 @@ def parse_args():
         default=10,
         help="Log every N steps",
     )
+    parser.add_argument(
+        "--eval_every",
+        type=int,
+        default=100,
+        help="Run evaluation and generate samples every N steps",
+    )
+    parser.add_argument(
+        "--num_eval_samples",
+        type=int,
+        default=4,
+        help="Number of samples to generate during evaluation",
+    )
     
     # Other arguments
     parser.add_argument(
@@ -287,27 +488,42 @@ def main():
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
     
-    # Initialize dataset
+    # Initialize datasets (train and val splits)
     if accelerator.is_main_process:
-        print("Loading dataset...")
+        print("Loading datasets...")
     
-    base_dataset = MimicVideoDataset(
+    # Training dataset
+    train_base_dataset = MimicVideoDataset(
         dataset_path=args.dataset_path,
         image_size=args.image_size,
         visual_context_length=args.visual_context_length,
         num_future_frames=args.num_future_frames,
         temporal_stride=args.temporal_stride,
+        split="train",
+        val_fraction=0.1,
     )
+    train_dataset = VideoFinetuneDataset(train_base_dataset)
     
-    dataset = VideoFinetuneDataset(base_dataset)
+    # Validation dataset
+    val_base_dataset = MimicVideoDataset(
+        dataset_path=args.dataset_path,
+        image_size=args.image_size,
+        visual_context_length=args.visual_context_length,
+        num_future_frames=args.num_future_frames,
+        temporal_stride=args.temporal_stride,
+        split="val",
+        val_fraction=0.1,
+    )
+    val_dataset = VideoFinetuneDataset(val_base_dataset)
     
     if accelerator.is_main_process:
-        print(f"Dataset size: {len(dataset)} samples")
-        print(f"Frames per view: {dataset.num_frames_per_view}")
+        print(f"Train dataset: {len(train_dataset)} samples ({train_base_dataset.num_episodes} episodes)")
+        print(f"Val dataset: {len(val_dataset)} samples ({val_base_dataset.num_episodes} episodes)")
+        print(f"Frames per view: {train_dataset.num_frames_per_view}")
     
-    # Create dataloader
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
+    # Create dataloaders
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -315,6 +531,17 @@ def main():
         collate_fn=collate_video_finetune,
         drop_last=True,
         persistent_workers=args.num_workers > 0,
+    )
+    
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=max(1, args.num_workers // 2),
+        pin_memory=True,
+        collate_fn=collate_video_finetune,
+        drop_last=False,
+        persistent_workers=False,
     )
     
     # Initialize model
@@ -353,8 +580,8 @@ def main():
     )
     
     # Prepare with accelerator
-    model, optimizer, dataloader, scheduler = accelerator.prepare(
-        model, optimizer, dataloader, scheduler
+    model, optimizer, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader, scheduler
     )
     
     # Resume from checkpoint if specified
@@ -391,7 +618,7 @@ def main():
     num_batches_since_log = 0
     
     while global_step < args.max_steps:
-        for batch in dataloader:
+        for batch in train_dataloader:
             if global_step >= args.max_steps:
                 break
             
@@ -445,6 +672,27 @@ def main():
                     
                     running_loss = 0.0
                     num_batches_since_log = 0
+                
+                # Evaluation and sample generation
+                if global_step % args.eval_every == 0:
+                    if accelerator.is_main_process:
+                        print(f"\nRunning evaluation at step {global_step}...")
+                    
+                    eval_results = run_evaluation(
+                        model=model,
+                        val_dataloader=val_dataloader,
+                        accelerator=accelerator,
+                        global_step=global_step,
+                        output_dir=args.output_dir,
+                        num_samples=args.num_eval_samples,
+                    )
+                    
+                    if accelerator.is_main_process:
+                        accelerator.log({
+                            "val_loss": eval_results["val_loss"],
+                        }, step=global_step)
+                        print(f"  Val loss: {eval_results['val_loss']:.4f}")
+                        print(f"  Saved {eval_results['num_samples']} samples to {eval_results['samples_dir']}")
                 
                 # Checkpointing
                 if global_step % args.checkpoint_every == 0:

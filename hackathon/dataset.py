@@ -49,6 +49,9 @@ class MimicVideoDataset(Dataset):
         image_size: Target size for resized images (square)
         video_key_high: Key for the high/front camera video
         video_key_wrist: Key for the wrist camera video
+        split: Data split - "train", "val", or "all"
+        val_fraction: Fraction of episodes for validation (default 0.1)
+        split_seed: Random seed for reproducible train/val split
     """
     
     def __init__(
@@ -61,6 +64,9 @@ class MimicVideoDataset(Dataset):
         image_size: int = 224,
         video_key_high: str = "observation.images.front",
         video_key_wrist: str = "observation.images.top",
+        split: str = "all",
+        val_fraction: float = 0.1,
+        split_seed: int = 42,
     ):
         self.dataset_path = Path(dataset_path)
         self.chunk_size = chunk_size
@@ -70,11 +76,14 @@ class MimicVideoDataset(Dataset):
         self.image_size = image_size
         self.video_key_high = video_key_high
         self.video_key_wrist = video_key_wrist
+        self.split = split
+        self.val_fraction = val_fraction
+        self.split_seed = split_seed
         
         # Load metadata
         self._load_metadata()
         
-        # Build step index mapping
+        # Build step index mapping (with train/val split)
         self._build_step_index()
         
         # Load all parquet data into memory for fast access
@@ -111,15 +120,18 @@ class MimicVideoDataset(Dataset):
         """Build mapping from global index to (episode_id, frame_index).
         
         This allows us to sample any frame across all episodes using a single index.
+        Applies train/val split based on episode boundaries.
         """
         self._step_to_episode_map = {}
         self._episode_lengths = {}
         self._episode_start_indices = {}
+        self._all_episode_lengths = {}  # Store all episode lengths before filtering
         
         # Load episode metadata from parquet files
         episodes_dir = self.dataset_path / "meta" / "episodes"
         
-        global_idx = 0
+        # First pass: collect all episode indices and lengths
+        all_episodes = []
         for chunk_dir in sorted(episodes_dir.iterdir()):
             if not chunk_dir.is_dir():
                 continue
@@ -130,19 +142,54 @@ class MimicVideoDataset(Dataset):
                 for _, row in episodes_df.iterrows():
                     episode_idx = int(row["episode_index"])
                     episode_length = int(row["length"])
-                    
-                    self._episode_lengths[episode_idx] = episode_length
-                    self._episode_start_indices[episode_idx] = global_idx
-                    
-                    for frame_idx in range(episode_length):
-                        self._step_to_episode_map[global_idx] = (episode_idx, frame_idx)
-                        global_idx += 1
+                    all_episodes.append((episode_idx, episode_length))
+                    self._all_episode_lengths[episode_idx] = episode_length
+        
+        # Sort by episode index for consistency
+        all_episodes.sort(key=lambda x: x[0])
+        all_episode_indices = [ep[0] for ep in all_episodes]
+        
+        # Compute train/val split
+        if self.split != "all":
+            # Deterministic shuffle for split
+            rng = np.random.RandomState(self.split_seed)
+            shuffled_indices = all_episode_indices.copy()
+            rng.shuffle(shuffled_indices)
+            
+            # Split point
+            num_val = max(1, int(len(shuffled_indices) * self.val_fraction))
+            val_episodes = set(shuffled_indices[:num_val])
+            train_episodes = set(shuffled_indices[num_val:])
+            
+            if self.split == "train":
+                selected_episodes = train_episodes
+            elif self.split == "val":
+                selected_episodes = val_episodes
+            else:
+                raise ValueError(f"Invalid split: {self.split}. Must be 'train', 'val', or 'all'")
+        else:
+            selected_episodes = set(all_episode_indices)
+        
+        self._selected_episodes = selected_episodes
+        
+        # Second pass: build index only for selected episodes
+        global_idx = 0
+        for episode_idx, episode_length in all_episodes:
+            if episode_idx not in selected_episodes:
+                continue
+            
+            self._episode_lengths[episode_idx] = episode_length
+            self._episode_start_indices[episode_idx] = global_idx
+            
+            for frame_idx in range(episode_length):
+                self._step_to_episode_map[global_idx] = (episode_idx, frame_idx)
+                global_idx += 1
         
         self._total_steps = global_idx
     
     def _load_parquet_data(self):
-        """Load all parquet data files into memory."""
-        self._episode_data: list[EpisodeData] = []
+        """Load parquet data files for selected episodes into memory."""
+        self._episode_data: dict[int, EpisodeData] = {}
         
         data_dir = self.dataset_path / "data"
         for chunk_dir in sorted(data_dir.iterdir()):
@@ -155,6 +202,10 @@ class MimicVideoDataset(Dataset):
                 
                 # Group by episode_index and sort to ensure order
                 for episode_idx, episode_df in sorted(df.groupby("episode_index")):
+                    # Skip episodes not in our split
+                    if episode_idx not in self._selected_episodes:
+                        continue
+                    
                     # Sort by frame_index
                     episode_df = episode_df.sort_values("frame_index").reset_index(drop=True)
                     
@@ -165,13 +216,18 @@ class MimicVideoDataset(Dataset):
                     task_indices = episode_df["task_index"].values.astype(np.int64)
                     global_indices = episode_df["index"].values.astype(np.int64)
                     
-                    self._episode_data.append(EpisodeData(
+                    self._episode_data[episode_idx] = EpisodeData(
                         actions=actions,
                         states=states,
                         timestamps=timestamps,
                         task_index=int(task_indices[0]) if len(task_indices) > 0 else 0,
                         global_indices=global_indices,
-                    ))
+                    )
+    
+    @property
+    def num_episodes(self) -> int:
+        """Return number of episodes in this split."""
+        return len(self._selected_episodes)
     
     def _get_episode_chunk(self, episode_idx: int) -> int:
         """Get chunk index for an episode."""
@@ -200,7 +256,7 @@ class MimicVideoDataset(Dataset):
         """Get a single training sample.
         
         Args:
-            idx: Global frame index
+            idx: Global frame index (within this split)
             
         Returns:
             MimicVideoItem with past/future frames, actions, proprio, and command
@@ -208,7 +264,7 @@ class MimicVideoDataset(Dataset):
         # Map global index to episode and frame
         episode_idx, frame_idx = self._step_to_episode_map[idx]
         episode_length = self._episode_lengths[episode_idx]
-        episode_data = self._episode_data[episode_idx]
+        episode_data = self._episode_data[episode_idx]  # Dict lookup now
         
         # Compute past frame indices with stride
         past_indices = self._get_past_indices(frame_idx, episode_length)
