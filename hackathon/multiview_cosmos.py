@@ -312,7 +312,6 @@ class MultiviewCosmosWrapper(nn.Module):
         )
         print(f"Replaced RoPE with per-view version (num_views={self.num_views})")
         
-        del pipeline
         
     def _apply_lora(self, r: int, alpha: int, dropout: float):
         """Apply LoRA to transformer."""
