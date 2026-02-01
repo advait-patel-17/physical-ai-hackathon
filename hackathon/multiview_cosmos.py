@@ -278,7 +278,11 @@ class MultiviewCosmosWrapper(nn.Module):
     def _load_pretrained(self, model_name: str):
         """Load pretrained Cosmos model components."""
         print(f"Loading pretrained model: {model_name}")
-        pipeline = DiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+        pipeline = DiffusionPipeline.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            safety_checker=None,
+        )
         
         self.vae = pipeline.vae
         self.transformer = pipeline.transformer
