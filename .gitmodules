@@ -4,3 +4,6 @@
 [submodule "mimic-video"]
 	path = mimic-video
 	url = https://github.com/lucidrains/mimic-video.git
+[submodule "cosmos-policy"]
+	path = cosmos-policy
+	url = https://github.com/NVlabs/cosmos-policy.git
