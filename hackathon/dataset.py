@@ -1,12 +1,51 @@
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
-
+import os
+g
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+
+
+def resolve_dataset_path(dataset_path: str) -> Path:
+    """Resolve dataset path, downloading from HuggingFace Hub if needed.
+    
+    Args:
+        dataset_path: Local path or HuggingFace dataset ID (e.g., "username/dataset-name")
+        
+    Returns:
+        Path to local dataset directory
+    """
+    path = Path(dataset_path)
+    
+    # Check if it's already a local path that exists
+    if path.exists():
+        return path
+    
+    # Check if it looks like a HuggingFace dataset ID (contains "/" but doesn't exist locally)
+    if "/" in dataset_path and not path.is_absolute():
+        print(f"Dataset '{dataset_path}' not found locally, downloading from HuggingFace Hub...")
+        try:
+            from huggingface_hub import snapshot_download
+            
+            # Download to HF cache
+            local_path = snapshot_download(
+                repo_id=dataset_path,
+                repo_type="dataset",
+            )
+            print(f"Downloaded to: {local_path}")
+            return Path(local_path)
+        except Exception as e:
+            raise ValueError(
+                f"Could not find dataset at '{dataset_path}' locally or download from HuggingFace Hub. "
+                f"Error: {e}"
+            )
+    
+    # Local path that doesn't exist
+    raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
 
 
 @dataclass
@@ -68,7 +107,8 @@ class MimicVideoDataset(Dataset):
         val_fraction: float = 0.1,
         split_seed: int = 42,
     ):
-        self.dataset_path = Path(dataset_path)
+        # Resolve dataset path (download from HF Hub if needed)
+        self.dataset_path = resolve_dataset_path(dataset_path)
         self.chunk_size = chunk_size
         self.temporal_stride = temporal_stride
         self.visual_context_length = visual_context_length
