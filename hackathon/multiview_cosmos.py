@@ -236,7 +236,7 @@ class MultiviewCosmosWrapper(nn.Module):
     
     def __init__(
         self,
-        model_name: str = 'nvidia/Cosmos-Predict2.5-2B/base/post-trained',
+        model_name: str = 'nvidia/Cosmos-Predict2.5-2B/',
         num_views: int = 2,
         view_embed_dim: int = 7,
         lora_r: int = 8,
