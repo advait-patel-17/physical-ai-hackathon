@@ -41,10 +41,10 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.tensorboard import SummaryWriter
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm.auto import tqdm
+import wandb
 
 from hackathon.dataset import MimicVideoDataset
 from hackathon.video_finetune_dataset import (
@@ -153,39 +153,41 @@ def create_comparison_grid(
 @torch.no_grad()
 def run_evaluation(
     model,
-    val_dataloader,
+    dataloader,
     accelerator: Accelerator,
     global_step: int,
     output_dir: str,
+    split: str = "val",
     num_samples: int = 4,
-    num_val_batches: int = 10,
+    num_batches_for_loss: int = 10,
     num_inference_steps: int = 10,
 ):
-    """Run validation and generate sample videos.
+    """Run evaluation and generate sample videos.
     
     Args:
         model: The model (may be wrapped by accelerator)
-        val_dataloader: Validation dataloader
+        dataloader: Dataloader for the split (train or val)
         accelerator: Accelerator instance
         global_step: Current training step
         output_dir: Directory to save samples
+        split: Name of the split ("train" or "val")
         num_samples: Number of samples to generate
-        num_val_batches: Number of batches for validation loss
+        num_batches_for_loss: Number of batches to compute loss over
         num_inference_steps: Number of inference steps for generation
         
     Returns:
-        Dictionary with val_loss and paths to saved samples
+        Dictionary with loss and paths to saved samples
     """
     model.eval()
     unwrapped_model = accelerator.unwrap_model(model)
     
-    # Compute validation loss
-    val_losses = []
-    val_iter = iter(val_dataloader)
+    # Compute loss over a few batches
+    losses = []
+    data_iter = iter(dataloader)
     
-    for _ in range(min(num_val_batches, len(val_dataloader))):
+    for _ in range(min(num_batches_for_loss, len(dataloader))):
         try:
-            front_videos, wrist_videos, prompts = next(val_iter)
+            front_videos, wrist_videos, prompts = next(data_iter)
         except StopIteration:
             break
         
@@ -193,21 +195,21 @@ def run_evaluation(
         wrist_videos = wrist_videos.to(accelerator.device)
         
         loss = unwrapped_model.compute_flow_loss(front_videos, wrist_videos, prompts)
-        val_losses.append(loss.item())
+        losses.append(loss.item())
     
-    avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0.0
+    avg_loss = sum(losses) / len(losses) if losses else 0.0
     
     # Generate sample videos
-    samples_dir = os.path.join(output_dir, "samples", f"step_{global_step}")
+    samples_dir = os.path.join(output_dir, "samples", f"step_{global_step}", split)
     os.makedirs(samples_dir, exist_ok=True)
     
-    # Get a few samples from validation set
-    val_iter = iter(val_dataloader)
+    # Get a few samples from the dataloader
+    data_iter = iter(dataloader)
     generated_samples = []
     
     for sample_idx in range(num_samples):
         try:
-            front_videos, wrist_videos, prompts = next(val_iter)
+            front_videos, wrist_videos, prompts = next(data_iter)
         except StopIteration:
             break
         
@@ -263,24 +265,34 @@ def run_evaluation(
         if accelerator.is_main_process:
             print(f"  Saved sample {sample_idx}: {prompt[0][:50]}...")
     
-    # Log to TensorBoard
+    # Log to WandB
     if accelerator.is_main_process and generated_samples:
-        # Log videos as image grids (TensorBoard video logging)
+        # Log videos to wandb
+        wandb_videos = {}
         for idx, sample in enumerate(generated_samples):
-            # Create comparison grids
-            front_grid = create_comparison_grid(sample["front_gt"], sample["front_gen"])
-            wrist_grid = create_comparison_grid(sample["wrist_gt"], sample["wrist_gen"])
+            # Convert tensors to numpy for wandb.Video
+            # Format: (T, C, H, W) -> (T, H, W, C) for wandb
+            front_gt_np = (sample["front_gt"].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+            front_gen_np = (sample["front_gen"].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+            wrist_gt_np = (sample["wrist_gt"].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+            wrist_gen_np = (sample["wrist_gen"].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
             
-            # Log to accelerator tracker
-            accelerator.log({
-                f"samples/front_{idx}": front_grid.unsqueeze(0),  # Add batch dim
-                f"samples/wrist_{idx}": wrist_grid.unsqueeze(0),
-            }, step=global_step)
+            # Create side-by-side comparison videos
+            T_min = min(front_gt_np.shape[0], front_gen_np.shape[0])
+            front_comparison = np.concatenate([front_gt_np[:T_min], front_gen_np[:T_min]], axis=2)  # Side by side
+            T_min_wrist = min(wrist_gt_np.shape[0], wrist_gen_np.shape[0])
+            wrist_comparison = np.concatenate([wrist_gt_np[:T_min_wrist], wrist_gen_np[:T_min_wrist]], axis=2)
+            
+            wandb_videos[f"{split}_samples/front_{idx}"] = wandb.Video(front_comparison, fps=8, format="mp4")
+            wandb_videos[f"{split}_samples/wrist_{idx}"] = wandb.Video(wrist_comparison, fps=8, format="mp4")
+        
+        # Log all videos at once
+        wandb.log(wandb_videos, step=global_step)
     
     model.train()
     
     return {
-        "val_loss": avg_val_loss,
+        "loss": avg_loss,
         "samples_dir": samples_dir,
         "num_samples": len(generated_samples),
     }
@@ -443,6 +455,18 @@ def parse_args():
         default=None,
         help="Path to checkpoint to resume from",
     )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="multiview-cosmos",
+        help="Weights & Biases project name",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Weights & Biases run name (auto-generated if not provided)",
+    )
     
     return parser.parse_args()
 
@@ -450,11 +474,11 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # Initialize accelerator
+    # Initialize accelerator with wandb
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with="tensorboard",
+        log_with="wandb",
         project_dir=args.output_dir,
     )
     
@@ -597,9 +621,25 @@ def main():
             starting_step = 0
         accelerator.load_state(args.resume_from_checkpoint)
     
-    # Initialize tracking
+    # Initialize wandb tracking
     if accelerator.is_main_process:
-        accelerator.init_trackers("multiview_cosmos_finetune")
+        accelerator.init_trackers(
+            project_name=args.wandb_project,
+            config={
+                "learning_rate": args.lr,
+                "warmup_steps": args.warmup_steps,
+                "max_steps": args.max_steps,
+                "weight_decay": args.weight_decay,
+                "grad_clip": args.grad_clip,
+                "batch_size": args.batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "lora_r": args.lora_r,
+                "lora_alpha": args.lora_alpha,
+                "model_name": args.model_name,
+                "dataset_path": args.dataset_path,
+            },
+            init_kwargs={"wandb": {"name": args.wandb_run_name}},
+        )
     
     # Training loop
     if accelerator.is_main_process:
@@ -678,21 +718,37 @@ def main():
                     if accelerator.is_main_process:
                         print(f"\nRunning evaluation at step {global_step}...")
                     
-                    eval_results = run_evaluation(
+                    # Run on validation set
+                    val_results = run_evaluation(
                         model=model,
-                        val_dataloader=val_dataloader,
+                        dataloader=val_dataloader,
                         accelerator=accelerator,
                         global_step=global_step,
                         output_dir=args.output_dir,
+                        split="val",
+                        num_samples=args.num_eval_samples,
+                    )
+                    
+                    # Run on train set (for sample generation comparison)
+                    train_results = run_evaluation(
+                        model=model,
+                        dataloader=train_dataloader,
+                        accelerator=accelerator,
+                        global_step=global_step,
+                        output_dir=args.output_dir,
+                        split="train",
                         num_samples=args.num_eval_samples,
                     )
                     
                     if accelerator.is_main_process:
                         accelerator.log({
-                            "val_loss": eval_results["val_loss"],
+                            "val_loss": val_results["loss"],
+                            "train_eval_loss": train_results["loss"],
                         }, step=global_step)
-                        print(f"  Val loss: {eval_results['val_loss']:.4f}")
-                        print(f"  Saved {eval_results['num_samples']} samples to {eval_results['samples_dir']}")
+                        print(f"  Val loss: {val_results['loss']:.4f}")
+                        print(f"  Train eval loss: {train_results['loss']:.4f}")
+                        print(f"  Saved {val_results['num_samples']} val samples to {val_results['samples_dir']}")
+                        print(f"  Saved {train_results['num_samples']} train samples to {train_results['samples_dir']}")
                 
                 # Checkpointing
                 if global_step % args.checkpoint_every == 0:

@@ -12,6 +12,6 @@ dependencies = [
     # Training dependencies
     "accelerate>=1.0.0",
     "peft>=0.10.0",
-    "tensorboard>=2.15.0",
+    "wandb>=0.17.0",
     "imageio[pyav]>=2.34.0",  # For video saving
 ]
