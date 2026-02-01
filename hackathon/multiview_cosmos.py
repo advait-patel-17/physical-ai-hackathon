@@ -30,9 +30,9 @@ def default(v, d):
     return v if exists(v) else d
 
 
-def logit_normal_sample(size, mu: float = 0.0, sigma: float = 1.0, device='cpu') -> Tensor:
+def logit_normal_sample(size, mu: float = 0.0, sigma: float = 1.0, device='cpu', dtype=None) -> Tensor:
     """Sample from logit-normal distribution for flow time τ_v."""
-    z = torch.randn(size, device=device) * sigma + mu
+    z = torch.randn(size, device=device, dtype=dtype) * sigma + mu
     return torch.sigmoid(z)
 
 
@@ -205,10 +205,11 @@ class MultiviewRotaryPosEmbed(nn.Module):
         # Repeat for each view (this is the per-view RoPE: each view gets same positions)
         freqs = freqs_single.repeat(self.num_views, 1)  # (num_views*T*H*W, hidden_size)
         
-        # Compute cos and sin
-        cos = torch.cos(freqs).float()
-        sin = torch.sin(freqs).float()
-        
+        # Compute cos and sin in same dtype as hidden_states (e.g. bfloat16) to avoid dtype mismatch
+        dtype = hidden_states.dtype
+        cos = torch.cos(freqs).to(dtype)
+        sin = torch.sin(freqs).to(dtype)
+
         return cos, sin
 
 
@@ -339,15 +340,15 @@ class MultiviewCosmosWrapper(nn.Module):
             new_in_features,
             old_proj.out_features,
             bias=old_proj.bias is not None,
-        ).to(dtype=old_proj.weight.dtype, device=old_proj.weight.device)
+        ).to(device=old_proj.weight.device)
 
-        # Copy original weights for the original channels
+        # Copy original weights for the original channels (cast to float32 for autocast compatibility)
         with torch.no_grad():
-            new_proj.weight[:, :old_in_features] = old_proj.weight
+            new_proj.weight[:, :old_in_features] = old_proj.weight.float()
             # Initialize new channel weights with small values
             nn.init.normal_(new_proj.weight[:, old_in_features:], std=0.02)
             if old_proj.bias is not None:
-                new_proj.bias.copy_(old_proj.bias)
+                new_proj.bias.copy_(old_proj.bias.float())
 
         # Replace the projection
         patch_embed.proj = new_proj
@@ -360,6 +361,7 @@ class MultiviewCosmosWrapper(nn.Module):
             r=r,
             lora_alpha=alpha,
             target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+            modules_to_save=["patch_embed"],
             lora_dropout=dropout,
             bias="none",
         )
@@ -502,11 +504,10 @@ class MultiviewCosmosWrapper(nn.Module):
         # The transformer handles this internally if we pass appropriate hints
         # For now, we'll use the standard forward pass
         
-        # Prepare timestep for transformer
-        if timestep.dim() == 1:
-            timestep = timestep.unsqueeze(1).expand(-1, T)  # (B, T)
-        
         # Scale timestep to [0, 1000] range expected by diffusers
+        # Keep as 1D (B,) - the transformer expects either 1D or 5D timestep
+        if timestep.dim() > 1:
+            timestep = timestep[:, 0]  # Take first element if multi-dim
         timestep_scaled = timestep * 1000.0
         
         # Create padding mask (all ones = no padding for fixed-size videos)
@@ -554,7 +555,7 @@ class MultiviewCosmosWrapper(nn.Module):
         
         # Sample flow time from logit-normal if not provided
         if tau is None:
-            tau = logit_normal_sample((B,), mu=0.0, sigma=1.0, device=device)
+            tau = logit_normal_sample((B,), mu=0.0, sigma=1.0, device=device, dtype=latents.dtype)
         
         # Sample noise
         noise = torch.randn_like(latents)
@@ -565,7 +566,10 @@ class MultiviewCosmosWrapper(nn.Module):
         noisy_latents = tau_expanded * latents + (1 - tau_expanded) * noise
         
         # Target flow: latents - noise (velocity from noise to data)
-        flow_target = latents - noise
+        # Only compute target for VAE latent channels (exclude view embedding channels)
+        # The transformer output only has latent_channels dimensions
+        C_lat = self.latent_channels
+        flow_target = latents[:, :C_lat] - noise[:, :C_lat]
         
         # Predict flow
         pred_flow = self.forward_transformer(
@@ -575,7 +579,7 @@ class MultiviewCosmosWrapper(nn.Module):
             frames_per_view=frames_per_view,
         )
         
-        # Compute MSE loss
+        # Compute MSE loss (pred_flow has latent_channels dims, matching flow_target)
         loss = F.mse_loss(pred_flow, flow_target)
         
         return loss

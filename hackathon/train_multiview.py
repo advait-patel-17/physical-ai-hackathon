@@ -118,7 +118,7 @@ def save_video_to_disk(
         import imageio as iio
     
     # Convert to numpy uint8: (T, C, H, W) -> (T, H, W, C)
-    video_np = video.permute(0, 2, 3, 1).cpu().numpy()
+    video_np = video.permute(0, 2, 3, 1).cpu().float().numpy()
     video_np = (video_np * 255).clip(0, 255).astype(np.uint8)
     
     # Save video
@@ -195,7 +195,8 @@ def run_evaluation(
         front_videos = front_videos.to(accelerator.device)
         wrist_videos = wrist_videos.to(accelerator.device)
         
-        loss = unwrapped_model.compute_flow_loss(front_videos, wrist_videos, prompts)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = unwrapped_model.compute_flow_loss(front_videos, wrist_videos, prompts)
         losses.append(loss.item())
     
     avg_loss = sum(losses) / len(losses) if losses else 0.0
@@ -229,15 +230,25 @@ def run_evaluation(
         front_future_gt = front_video[:, T_ctx:]
         wrist_future_gt = wrist_video[:, T_ctx:]
         
-        # Generate future frames
+        # Generate future frames (under autocast on CUDA to match model dtype and avoid float vs bfloat16 errors)
         try:
-            front_gen, wrist_gen = unwrapped_model.generate(
-                front_context,
-                wrist_context,
-                prompt,
-                num_inference_steps=num_inference_steps,
-                num_frames_to_generate=T_future * 8,  # Account for temporal compression
-            )
+            if accelerator.device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    front_gen, wrist_gen = unwrapped_model.generate(
+                        front_context,
+                        wrist_context,
+                        prompt,
+                        num_inference_steps=num_inference_steps,
+                        num_frames_to_generate=T_future * 8,  # Account for temporal compression
+                    )
+            else:
+                front_gen, wrist_gen = unwrapped_model.generate(
+                    front_context,
+                    wrist_context,
+                    prompt,
+                    num_inference_steps=num_inference_steps,
+                    num_frames_to_generate=T_future * 8,  # Account for temporal compression
+                )
         except Exception as e:
             print(f"Generation failed for sample {sample_idx}: {e}")
             continue
@@ -273,10 +284,10 @@ def run_evaluation(
         for idx, sample in enumerate(generated_samples):
             # Convert tensors to numpy for wandb.Video
             # Format: (T, C, H, W) -> (T, H, W, C) for wandb
-            front_gt_np = (sample["front_gt"].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
-            front_gen_np = (sample["front_gen"].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
-            wrist_gt_np = (sample["wrist_gt"].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
-            wrist_gen_np = (sample["wrist_gen"].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+            front_gt_np = (sample["front_gt"].permute(0, 2, 3, 1).cpu().float().numpy() * 255).astype(np.uint8)
+            front_gen_np = (sample["front_gen"].permute(0, 2, 3, 1).cpu().float().numpy() * 255).astype(np.uint8)
+            wrist_gt_np = (sample["wrist_gt"].permute(0, 2, 3, 1).cpu().float().numpy() * 255).astype(np.uint8)
+            wrist_gen_np = (sample["wrist_gen"].permute(0, 2, 3, 1).cpu().float().numpy() * 255).astype(np.uint8)
             
             # Create side-by-side comparison videos
             T_min = min(front_gt_np.shape[0], front_gen_np.shape[0])
@@ -680,7 +691,7 @@ def main():
             
             front_videos, wrist_videos, prompts = batch
             
-            with accelerator.accumulate(model):
+            with accelerator.accumulate(model), accelerator.autocast():
                 # Compute loss
                 loss = model.module.compute_flow_loss(
                     front_video=front_videos,
