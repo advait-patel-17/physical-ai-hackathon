@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 from typing import Optional, Tuple, List
-from diffusers import DiffusionPipeline
 
 import torch
 import torch.nn as nn
@@ -276,18 +275,26 @@ class MultiviewCosmosWrapper(nn.Module):
         self.lora_alpha = lora_alpha
         
     def _load_pretrained(self, model_name: str):
-        """Load pretrained Cosmos model components."""
-        print(f"Loading pretrained model: {model_name}")
-        pipeline = DiffusionPipeline.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            safety_checker=None,
+        """Load pretrained Cosmos model components directly (bypasses safety checker)."""
+        from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
+        from diffusers.models.transformers.transformer_cosmos import CosmosTransformer3DModel
+        from transformers import T5EncoderModel, T5TokenizerFast
+
+        print(f"Loading pretrained model components from: {model_name}")
+
+        # Load each component directly to avoid cosmos_guardrail dependency
+        self.vae = AutoencoderKLWan.from_pretrained(
+            model_name, subfolder="vae", torch_dtype=torch.bfloat16
         )
-        
-        self.vae = pipeline.vae
-        self.transformer = pipeline.transformer
-        self.text_encoder = pipeline.text_encoder
-        self.tokenizer = pipeline.tokenizer
+        self.transformer = CosmosTransformer3DModel.from_pretrained(
+            model_name, subfolder="transformer", torch_dtype=torch.bfloat16
+        )
+        self.text_encoder = T5EncoderModel.from_pretrained(
+            model_name, subfolder="text_encoder", torch_dtype=torch.bfloat16
+        )
+        self.tokenizer = T5TokenizerFast.from_pretrained(
+            model_name, subfolder="tokenizer"
+        )
         
         # Store VAE config
         self.vae_temporal_compression = self.vae.config.temporal_compression_ratio
