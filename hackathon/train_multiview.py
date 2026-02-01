@@ -338,7 +338,7 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="nvidia/Cosmos-Predict2.5-2B",
+        default="nvidia/Cosmos-Predict2-2B-Video2World",
         help="Pretrained model name",
     )
     parser.add_argument(
