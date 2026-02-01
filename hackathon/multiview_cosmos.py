@@ -302,6 +302,12 @@ class MultiviewCosmosWrapper(nn.Module):
         self.vae_spatial_compression = self.vae.config.scale_factor_spatial
         self.latent_channels = self.vae.config.z_dim
 
+        # Flow-space scaling: use per-channel stats from VAE config (not fixed 0/1)
+        # See pipeline_cosmos2_video2world.py L306–311 and vae/config.json (latents_mean, latents_std)
+        self.sigma_data = 1.0
+        self._latents_mean = self._latents_std = None
+        self._register_latent_stats()
+
         # Replace transformer's RoPE with per-view version
         # This ensures RoPE positions reset for each view instead of being continuous
         self.transformer.rope = MultiviewRotaryPosEmbed(
@@ -315,6 +321,50 @@ class MultiviewCosmosWrapper(nn.Module):
 
         # Resize patch_embed to handle extra channels from view embeddings
         self._resize_patch_embed_for_view_channels()
+
+    def _register_latent_stats(self):
+        """Register per-channel latent mean/std from VAE config (flow-space scaling).
+        These are model-specific, not fixed: see nvidia/Cosmos-Predict2-2B-Video2World vae/config.json.
+        """
+        mean = getattr(self.vae.config, "latents_mean", None)
+        std = getattr(self.vae.config, "latents_std", None)
+        z = self.latent_channels
+        if mean is not None and std is not None and len(mean) == z and len(std) == z:
+            self._latents_mean = torch.tensor(mean, dtype=torch.float32).view(1, z, 1, 1, 1)
+            self._latents_std = torch.tensor(std, dtype=torch.float32).view(1, z, 1, 1, 1)
+        else:
+            self._latents_mean = torch.zeros(1, z, 1, 1, 1, dtype=torch.float32)
+            self._latents_std = torch.ones(1, z, 1, 1, 1, dtype=torch.float32)
+
+    def _normalize_latent(self, latent: Tensor) -> Tensor:
+        """(latent - mean) / std * sigma_data. Per-channel: mean/std from VAE config.
+        Matches diffusers pipeline_cosmos_video2world prepare_latents: (z - mean) * sigma_data / std."""
+        device, dtype = latent.device, latent.dtype
+        mean = self._latents_mean.to(device=device, dtype=dtype)
+        std = self._latents_std.to(device=device, dtype=dtype)
+        return (latent - mean) / std * self.sigma_data
+
+    def _denormalize_latent(self, latent: Tensor) -> Tensor:
+        """latent * std / sigma_data + mean. Per-channel: mean/std from VAE config.
+        Matches diffusers pipeline decode: latents * latents_std / sigma_data + latents_mean."""
+        device, dtype = latent.device, latent.dtype
+        mean = self._latents_mean.to(device=device, dtype=dtype)
+        std = self._latents_std.to(device=device, dtype=dtype)
+        return latent * std / self.sigma_data + mean
+
+    def _edm_c_in(self, sigma: Tensor) -> Tensor:
+        """EDM preconditioning: c_in = 1 / sqrt(sigma^2 + sigma_data^2)."""
+        return 1.0 / (sigma**2 + self.sigma_data**2) ** 0.5
+
+    def _edm_c_skip_c_out(self, sigma: Tensor) -> Tuple[Tensor, Tensor]:
+        """EDM preconditioning: c_skip, c_out for x0 = c_skip*sample + c_out*model_output (epsilon prediction)."""
+        c_skip = (self.sigma_data**2) / (sigma**2 + self.sigma_data**2)
+        c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2) ** 0.5
+        return c_skip, c_out
+
+    def _edm_c_noise(self, sigma: Tensor) -> Tensor:
+        """EDM timestep embedding: c_noise = 0.25 * log(sigma). Passed to transformer as timestep."""
+        return 0.25 * torch.log(sigma.clamp(min=1e-9))
 
     def _resize_patch_embed_for_view_channels(self):
         """Resize patch_embed projection to handle extra channels from view embeddings.
@@ -395,19 +445,20 @@ class MultiviewCosmosWrapper(nn.Module):
 
         with torch.no_grad():
             latent = self.vae.encode(video).latent_dist.sample()
-        
-        return latent
+        # Normalize to flow space using per-channel stats from VAE config (pipeline L306–311)
+        return self._normalize_latent(latent)
     
     def decode_latent(self, latent: Tensor) -> Tensor:
         """Decode latent to video using VAE.
 
         Args:
-            latent: Latent tensor (B, C, T, H, W)
+            latent: Latent tensor (B, C, T, H, W) in flow-normalized space
 
         Returns:
             Video tensor (B, T, C, H, W) in [0, 1]
         """
-        # Cast to VAE dtype (typically bfloat16)
+        # Denormalize from flow space using per-channel stats from VAE config (pipeline L764–774)
+        latent = self._denormalize_latent(latent)
         latent = latent.to(dtype=self.vae.dtype)
 
         with torch.no_grad():
@@ -486,40 +537,37 @@ class MultiviewCosmosWrapper(nn.Module):
         timestep: Tensor,
         text_embeds: Tensor,
         frames_per_view: Optional[int] = None,
+        fps: Optional[int] = None,
+        condition_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward pass through transformer.
         
         Args:
-            latent: Input latent (B, C, T, H, W)
-            timestep: Flow timestep (B,) or (B, T)
+            latent: Input latent (B, C, T, H, W), already scaled by c_in when using EDM
+            timestep: EDM c_noise = 0.25*log(sigma) (B,) — pass as-is; diffusers does NOT use [0,1000]
             text_embeds: Text embeddings from T5
             frames_per_view: For per-view RoPE construction
+            fps: FPS for RoPE (default 16)
+            condition_mask: (B, 1, T, H, W) ones=conditioned, zeros=generated; concat to channels if provided
             
         Returns:
-            Predicted flow/velocity (B, C, T, H, W)
+            Model output (B, C_lat, T, H, W) — combine with c_skip/c_out for x0 in EDM
         """
         B, C, T, H, W = latent.shape
         
-        # For multiview, we need to construct RoPE separately per view
-        # The transformer handles this internally if we pass appropriate hints
-        # For now, we'll use the standard forward pass
-        
-        # Scale timestep to [0, 1000] range expected by diffusers
-        # Keep as 1D (B,) - the transformer expects either 1D or 5D timestep
         if timestep.dim() > 1:
-            timestep = timestep[:, 0]  # Take first element if multi-dim
-        timestep_scaled = timestep * 1000.0
-        
-        # Create padding mask (all ones = no padding for fixed-size videos)
-        # Shape (1, 1, H, W) so that after unsqueeze(2).repeat() it becomes (B, 1, T, H, W)
+            timestep = timestep[:, 0]
+        # Diffusers Cosmos uses EDMEulerScheduler: timestep = c_noise = 0.25*log(sigma). Do NOT scale by 1000.
+
         _, _, _, H, W = latent.shape
         padding_mask = torch.ones(1, 1, H, W, device=latent.device, dtype=latent.dtype)
 
-        # Forward through transformer
         output = self.transformer(
             hidden_states=latent,
-            timestep=timestep_scaled,
+            timestep=timestep,
             encoder_hidden_states=text_embeds,
+            fps=fps if fps is not None else 16,
+            condition_mask=condition_mask,
             padding_mask=padding_mask,
             return_dict=False,
         )[0]
@@ -531,57 +579,66 @@ class MultiviewCosmosWrapper(nn.Module):
         front_video: Tensor,
         wrist_video: Tensor,
         prompts: List[str],
-        tau: Optional[Tensor] = None,
+        sigma_min: float = 0.002,
+        sigma_max: float = 80.0,
     ) -> Tensor:
-        """Compute flow matching loss for training.
+        """Compute EDM denoising loss (aligns with diffusers Cosmos / EDMEulerScheduler).
+        
+        Sample sigma, xt = x0 + sigma*noise; model input = c_in*xt, timestep = c_noise;
+        target model output satisfies c_skip*xt + c_out*pred = x0 => pred = (x0 - c_skip*xt)/c_out.
         
         Args:
             front_video: Front camera video (B, T, C, H, W) in [0, 1]
             wrist_video: Wrist camera video (B, T, C, H, W) in [0, 1]
             prompts: List of text prompts
-            tau: Optional pre-sampled flow time, otherwise sampled from logit-normal
+            sigma_min, sigma_max: Sigma range for training (log-uniform sample)
             
         Returns:
-            MSE loss between predicted and target flow
+            MSE loss between predicted and target model output
         """
         B = front_video.shape[0]
         device = front_video.device
         
-        # Encode text
         text_embeds = self.encode_text(prompts)
-        
-        # Prepare multiview latents
         latents, frames_per_view = self.prepare_multiview_latents(front_video, wrist_video)
-        
-        # Sample flow time from logit-normal if not provided
-        if tau is None:
-            tau = logit_normal_sample((B,), mu=0.0, sigma=1.0, device=device, dtype=latents.dtype)
-        
-        # Sample noise
-        noise = torch.randn_like(latents)
-        
-        # Interpolate between noise and data
-        # noisy_latents = tau * latents + (1 - tau) * noise
-        tau_expanded = tau.view(B, 1, 1, 1, 1)
-        noisy_latents = tau_expanded * latents + (1 - tau_expanded) * noise
-        
-        # Target flow: latents - noise (velocity from noise to data)
-        # Only compute target for VAE latent channels (exclude view embedding channels)
-        # The transformer output only has latent_channels dimensions
         C_lat = self.latent_channels
-        flow_target = latents[:, :C_lat] - noise[:, :C_lat]
         
-        # Predict flow
-        pred_flow = self.forward_transformer(
-            noisy_latents,
-            tau,
+        # Sample sigma (log-uniform in [sigma_min, sigma_max])
+        u = torch.rand(B, device=device, dtype=latents.dtype)
+        log_sigma = torch.log(torch.tensor(sigma_min, device=device, dtype=latents.dtype)) + u * (
+            torch.log(torch.tensor(sigma_max, device=device, dtype=latents.dtype)) - torch.log(torch.tensor(sigma_min, device=device, dtype=latents.dtype))
+        )
+        sigma = log_sigma.exp()
+        sigma = sigma.view(B, 1, 1, 1, 1)
+        
+        # xt = x0 + sigma*noise (EDM forward; only latent channels)
+        noise = torch.randn(B, C_lat, latents.shape[2], latents.shape[3], latents.shape[4], device=device, dtype=latents.dtype)
+        x0_lat = latents[:, :C_lat]
+        xt_lat = x0_lat + sigma * noise
+        
+        # Replace latent channels in full tensor (keep view embedding channels)
+        noisy_latents = latents.clone()
+        noisy_latents[:, :C_lat] = xt_lat
+        
+        # EDM preconditioning: scale input by c_in, pass c_noise as timestep
+        c_in = self._edm_c_in(sigma)
+        scaled_latents = noisy_latents.clone()
+        scaled_latents[:, :C_lat] = noisy_latents[:, :C_lat] * c_in
+        
+        c_noise = self._edm_c_noise(sigma)
+        c_noise_b = c_noise.squeeze()
+        
+        pred = self.forward_transformer(
+            scaled_latents,
+            c_noise_b,
             text_embeds,
             frames_per_view=frames_per_view,
         )
         
-        # Compute MSE loss (pred_flow has latent_channels dims, matching flow_target)
-        loss = F.mse_loss(pred_flow, flow_target)
-        
+        c_skip, c_out = self._edm_c_skip_c_out(sigma)
+        # Target: c_skip*xt + c_out*target = x0 => target = (x0 - c_skip*xt) / c_out
+        target = (x0_lat - c_skip * xt_lat) / c_out.clamp(min=1e-7)
+        loss = F.mse_loss(pred[:, :C_lat], target)
         return loss
     
     @torch.no_grad()
@@ -592,103 +649,131 @@ class MultiviewCosmosWrapper(nn.Module):
         prompts: List[str],
         num_inference_steps: int = 10,
         num_frames_to_generate: int = 5,
+        sigma_max: float = 80.0,
+        fps: int = 16,
     ) -> Tuple[Tensor, Tensor]:
-        """Generate future frames using flow matching sampling.
+        """Generate future frames using EDM sampling (aligns with diffusers Cosmos pipeline).
+        
+        Uses EDMEulerScheduler logic: sigma schedule, c_in/c_skip/c_out preconditioning,
+        timestep = c_noise = 0.25*log(sigma), and scheduler.step for ODE integration.
         
         Args:
             front_context: Front camera context frames (B, T_ctx, C, H, W) in [0, 1]
             wrist_context: Wrist camera context frames (B, T_ctx, C, H, W) in [0, 1]
             prompts: List of text prompts
-            num_inference_steps: Number of ODE integration steps (more = better quality)
+            num_inference_steps: Number of denoising steps
             num_frames_to_generate: Number of future frames to generate per view
+            sigma_max: Max sigma for initial noise (pipeline: latents * sigma_max)
+            fps: FPS for transformer RoPE
             
         Returns:
             Tuple of (front_generated, wrist_generated) both (B, T_gen, C, H, W) in [0, 1]
         """
+        from diffusers import EDMEulerScheduler
+
         B = front_context.shape[0]
         device = front_context.device
         
-        # Encode text
         text_embeds = self.encode_text(prompts)
-        
-        # Encode context frames to latent
-        front_ctx_latent = self.encode_video(front_context)  # (B, C_lat, T'_ctx, H', W')
+        front_ctx_latent = self.encode_video(front_context)
         wrist_ctx_latent = self.encode_video(wrist_context)
         
         _, C_lat, T_ctx_lat, H_lat, W_lat = front_ctx_latent.shape
         
-        # Compute number of latent frames to generate
-        # Temporal compression = 8 for Cosmos VAE
-        T_gen_lat = num_frames_to_generate // self.vae_temporal_compression
-        T_gen_lat = max(1, T_gen_lat)
+        T_gen_lat = max(1, num_frames_to_generate // self.vae_temporal_compression)
         
-        # Initialize future latent frames with pure noise
+        # Initial noise scaled by sigma_max (pipeline_cosmos_video2world prepare_latents)
         front_future_latent = torch.randn(B, C_lat, T_gen_lat, H_lat, W_lat, device=device, dtype=front_ctx_latent.dtype)
         wrist_future_latent = torch.randn(B, C_lat, T_gen_lat, H_lat, W_lat, device=device, dtype=wrist_ctx_latent.dtype)
+        front_future_latent = front_future_latent * sigma_max
+        wrist_future_latent = wrist_future_latent * sigma_max
         
-        # Add view embeddings to context
         front_ctx_with_emb = self.view_embedding(front_ctx_latent, view_idx=0)
         wrist_ctx_with_emb = self.view_embedding(wrist_ctx_latent, view_idx=1)
         
-        # Flow matching ODE integration: t goes from 1 (noise) to 0 (data)
-        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+        # Scheduler: same config as pipeline (sigma_data must match our normalize)
+        scheduler = EDMEulerScheduler(
+            sigma_min=0.002,
+            sigma_max=sigma_max,
+            sigma_data=self.sigma_data,
+            sigma_schedule="karras",
+            num_train_timesteps=1000,
+            prediction_type="epsilon",
+        )
+        scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = scheduler.timesteps  # c_noise = 0.25*log(sigma)
+        sigmas = scheduler.sigmas
         
         for i in range(num_inference_steps):
-            t_current = timesteps[i]
-            t_next = timesteps[i + 1]
-            dt = t_next - t_current  # Negative (going from 1 to 0)
+            t = timesteps[i]
+            sigma = sigmas[i]
+            if not isinstance(sigma, torch.Tensor):
+                sigma = torch.tensor(sigma, device=device, dtype=front_ctx_latent.dtype)
+            sigma = sigma.to(device).to(front_ctx_latent.dtype)
             
-            # Add view embeddings to current future latents
             front_future_with_emb = self.view_embedding(front_future_latent, view_idx=0)
             wrist_future_with_emb = self.view_embedding(wrist_future_latent, view_idx=1)
-            
-            # Concatenate context + future along temporal dimension
             front_full = torch.cat([front_ctx_with_emb, front_future_with_emb], dim=2)
             wrist_full = torch.cat([wrist_ctx_with_emb, wrist_future_with_emb], dim=2)
-            
-            # Concatenate views along temporal dimension
             multiview_latent = torch.cat([front_full, wrist_full], dim=2)
             
-            # Create timestep tensor: context at t=0 (clean), future at t_current
             T_total = multiview_latent.shape[2]
             T_ctx = front_ctx_with_emb.shape[2]
             T_future = front_future_with_emb.shape[2]
             
-            # Build per-frame timesteps
-            timestep_tensor = torch.zeros(B, T_total, device=device, dtype=multiview_latent.dtype)
-            # Future frames of view 1: T_ctx to T_ctx + T_future
-            timestep_tensor[:, T_ctx:T_ctx + T_future] = t_current
-            # Future frames of view 2: T_ctx + T_future + T_ctx to end
-            timestep_tensor[:, T_ctx + T_future + T_ctx:] = t_current
+            # EDM scale model input (c_in) — pipeline calls scheduler.scale_model_input; only scale latent channels
+            c_in = self._edm_c_in(sigma)
+            c_in_5d = c_in.reshape(1, 1, 1, 1, 1).to(device=multiview_latent.device, dtype=multiview_latent.dtype)
+            scaled_latent = multiview_latent.clone()
+            scaled_latent[:, :C_lat] = multiview_latent[:, :C_lat] * c_in_5d
             
-            # Predict flow
-            pred_flow = self.forward_transformer(
-                multiview_latent,
-                timestep_tensor[:, 0],  # Scalar timestep for now (simplified)
+            # Condition mask: 1 = context, 0 = future (pipeline cond_indicator * ones + (1-cond_indicator)*zeros)
+            cond_indicator = torch.zeros(1, 1, T_total, 1, 1, device=device, dtype=multiview_latent.dtype)
+            cond_indicator[:, :, :T_ctx] = 1.0
+            cond_indicator[:, :, T_ctx + T_future : T_ctx + T_future + T_ctx] = 1.0
+            ones_pad = scaled_latent.new_ones(1, 1, T_total, H_lat, W_lat)
+            zeros_pad = scaled_latent.new_zeros(1, 1, T_total, H_lat, W_lat)
+            condition_mask = (cond_indicator * ones_pad + (1 - cond_indicator) * zeros_pad).expand(B, 1, T_total, H_lat, W_lat)
+            
+            timestep_b = t.expand(B).to(multiview_latent.dtype)
+            
+            model_output = self.forward_transformer(
+                scaled_latent,
+                timestep_b,
                 text_embeds,
+                fps=fps,
+                condition_mask=condition_mask,
             )
             
-            # Extract predicted flow for future frames only
-            # View 1 future: positions T_ctx to T_ctx + T_future
-            # View 2 future: positions T_ctx + T_future + T_ctx to end
-            C_with_emb = front_ctx_with_emb.shape[1]
+            # Full current sample (latent channels only) for scheduler
+            full_sample = multiview_latent[:, :C_lat].clone()
+            full_sample[:, :, :T_ctx] = front_ctx_latent
+            full_sample[:, :, T_ctx : T_ctx + T_future] = front_future_latent
+            full_sample[:, :, T_ctx + T_future : T_ctx + T_future + T_ctx] = wrist_ctx_latent
+            full_sample[:, :, T_ctx + T_future + T_ctx :] = wrist_future_latent
             
-            front_future_flow = pred_flow[:, :C_with_emb, T_ctx:T_ctx + T_future, :, :]
-            wrist_future_flow = pred_flow[:, :C_with_emb, T_ctx + T_future + T_ctx:, :, :]
+            # EDM pred_x0 = c_skip*sample + c_out*model_output; scheduler.step does this if pred_original_sample is None
+            c_skip, c_out = self._edm_c_skip_c_out(sigma)
+            c_skip_5d = c_skip.reshape(1, 1, 1, 1, 1).to(device=model_output.device, dtype=model_output.dtype)
+            c_out_5d = c_out.reshape(1, 1, 1, 1, 1).to(device=model_output.device, dtype=model_output.dtype)
+            pred_x0 = c_skip_5d * full_sample + c_out_5d * model_output[:, :C_lat]
+            # Pin context: pred_original_sample equals sample on context frames so derivative is 0 there
+            pred_x0[:, :, :T_ctx] = full_sample[:, :, :T_ctx]
+            pred_x0[:, :, T_ctx + T_future : T_ctx + T_future + T_ctx] = full_sample[:, :, T_ctx + T_future : T_ctx + T_future + T_ctx]
             
-            # Remove view embedding channels from flow (keep only latent channels)
-            front_future_flow = front_future_flow[:, :C_lat, :, :, :]
-            wrist_future_flow = wrist_future_flow[:, :C_lat, :, :, :]
+            prev_sample = scheduler.step(
+                model_output[:, :C_lat],
+                t,
+                full_sample,
+                return_dict=False,
+                pred_original_sample=pred_x0,
+            )[0]
             
-            # Euler step: x_next = x_current + dt * flow
-            # dt is negative, and flow points from noise to data
-            front_future_latent = front_future_latent + dt * front_future_flow
-            wrist_future_latent = wrist_future_latent + dt * wrist_future_flow
+            front_future_latent = prev_sample[:, :, T_ctx : T_ctx + T_future]
+            wrist_future_latent = prev_sample[:, :, T_ctx + T_future + T_ctx :]
         
-        # Decode generated latents to pixels
-        front_generated = self.decode_latent(front_future_latent)  # (B, T_gen, C, H, W)
+        front_generated = self.decode_latent(front_future_latent)
         wrist_generated = self.decode_latent(wrist_future_latent)
-        
         return front_generated, wrist_generated
     
     def save_checkpoint(self, path: str, step: int):
