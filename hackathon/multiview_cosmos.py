@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional, Tuple, List
+from diffusers import DiffusionPipeline
 
 import torch
 import torch.nn as nn
@@ -279,10 +280,7 @@ class MultiviewCosmosWrapper(nn.Module):
         from diffusers import CosmosVideoToWorldPipeline
         
         print(f"Loading pretrained model: {model_name}")
-        pipeline = CosmosVideoToWorldPipeline.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-        )
+        DiffusionPipeline.from_pretrained("nvidia/Cosmos-Predict2.5-2B", dtype=torch.bfloat16, device_map="cuda")
         
         self.vae = pipeline.vae
         self.transformer = pipeline.transformer
