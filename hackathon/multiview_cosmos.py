@@ -367,43 +367,37 @@ class MultiviewCosmosWrapper(nn.Module):
         return 0.25 * torch.log(sigma.clamp(min=1e-9))
 
     def _resize_patch_embed_for_view_channels(self):
-        """Resize patch_embed projection to handle extra channels from view embeddings.
+        """Resize patch_embed projection to handle extra channels from view embeddings and masks.
 
-        The view embeddings add `view_embed_dim` channels to the latent input.
-        We need to expand the patch_embed.proj linear layer to accept these extra channels.
+        The transformer receives: hidden_states then (if not None) condition_mask then padding_mask.
+        So total channels = latent + view_embed + condition_mask + padding_mask = 16 + 7 + 1 + 1 = 25.
         """
         patch_embed = self.transformer.patch_embed
         old_proj = patch_embed.proj
 
-        # Get patch size from config
         patch_size = self.transformer.config.patch_size  # (t, h, w)
         patch_volume = patch_size[0] * patch_size[1] * patch_size[2]
 
-        # Calculate new input features based on actual channel structure:
-        # VAE latent (16) + view_embed (7) + padding_mask (1) = 24 channels
+        # Channel order in transformer: latent (16) + view_embed (7) + condition_mask (1) + padding_mask (1) = 25
         old_in_features = old_proj.in_features
-        new_channels = self.latent_channels + self.view_embed_dim + 1  # +1 for padding_mask
+        new_channels = self.latent_channels + self.view_embed_dim + 1 + 1  # +1 condition_mask, +1 padding_mask
         new_in_features = new_channels * patch_volume
 
-        # Create new projection layer
         new_proj = nn.Linear(
             new_in_features,
             old_proj.out_features,
             bias=old_proj.bias is not None,
         ).to(device=old_proj.weight.device)
 
-        # Copy original weights for the original channels (cast to float32 for autocast compatibility)
         with torch.no_grad():
             new_proj.weight[:, :old_in_features] = old_proj.weight.float()
-            # Initialize new channel weights with small values
             nn.init.normal_(new_proj.weight[:, old_in_features:], std=0.02)
             if old_proj.bias is not None:
                 new_proj.bias.copy_(old_proj.bias.float())
 
-        # Replace the projection
         patch_embed.proj = new_proj
         print(f"Resized patch_embed: {old_in_features} -> {new_in_features} features "
-              f"({new_channels} channels: {self.latent_channels} VAE + {self.view_embed_dim} view + 1 padding)")
+              f"({new_channels} channels: {self.latent_channels} VAE + {self.view_embed_dim} view + 1 cond_mask + 1 padding)")
 
     def _apply_lora(self, r: int, alpha: int, dropout: float):
         """Apply LoRA to transformer."""
@@ -561,6 +555,10 @@ class MultiviewCosmosWrapper(nn.Module):
 
         _, _, _, H, W = latent.shape
         padding_mask = torch.ones(1, 1, H, W, device=latent.device, dtype=latent.dtype)
+
+        # patch_embed is resized for 25 channels (latent+view_embed+condition_mask+padding). Always pass condition_mask.
+        if condition_mask is None:
+            condition_mask = torch.ones(B, 1, T, H, W, device=latent.device, dtype=latent.dtype)
 
         output = self.transformer(
             hidden_states=latent,
@@ -721,11 +719,17 @@ class MultiviewCosmosWrapper(nn.Module):
             T_ctx = front_ctx_with_emb.shape[2]
             T_future = front_future_with_emb.shape[2]
             
-            # EDM scale model input (c_in) — pipeline calls scheduler.scale_model_input; only scale latent channels
-            c_in = self._edm_c_in(sigma)
-            c_in_5d = c_in.reshape(1, 1, 1, 1, 1).to(device=multiview_latent.device, dtype=multiview_latent.dtype)
+            # Full current sample (latent channels only) for scheduler — build before scaling
+            full_sample = multiview_latent[:, :C_lat].clone()
+            full_sample[:, :, :T_ctx] = front_ctx_latent
+            full_sample[:, :, T_ctx : T_ctx + T_future] = front_future_latent
+            full_sample[:, :, T_ctx + T_future : T_ctx + T_future + T_ctx] = wrist_ctx_latent
+            full_sample[:, :, T_ctx + T_future + T_ctx :] = wrist_future_latent
+            
+            # EDM scale model input: use scheduler so _step_index and is_scale_input_called are set, and we get c_in * sample
+            scaled_full_sample = scheduler.scale_model_input(full_sample, t)
             scaled_latent = multiview_latent.clone()
-            scaled_latent[:, :C_lat] = multiview_latent[:, :C_lat] * c_in_5d
+            scaled_latent[:, :C_lat] = scaled_full_sample
             
             # Condition mask: 1 = context, 0 = future (pipeline cond_indicator * ones + (1-cond_indicator)*zeros)
             cond_indicator = torch.zeros(1, 1, T_total, 1, 1, device=device, dtype=multiview_latent.dtype)
@@ -744,13 +748,6 @@ class MultiviewCosmosWrapper(nn.Module):
                 fps=fps,
                 condition_mask=condition_mask,
             )
-            
-            # Full current sample (latent channels only) for scheduler
-            full_sample = multiview_latent[:, :C_lat].clone()
-            full_sample[:, :, :T_ctx] = front_ctx_latent
-            full_sample[:, :, T_ctx : T_ctx + T_future] = front_future_latent
-            full_sample[:, :, T_ctx + T_future : T_ctx + T_future + T_ctx] = wrist_ctx_latent
-            full_sample[:, :, T_ctx + T_future + T_ctx :] = wrist_future_latent
             
             # EDM pred_x0 = c_skip*sample + c_out*model_output; scheduler.step does this if pred_original_sample is None
             c_skip, c_out = self._edm_c_skip_c_out(sigma)
