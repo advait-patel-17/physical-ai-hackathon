@@ -9,4 +9,8 @@ dependencies = [
     "mimic-video>=0.0.47",
     "numpy>=2.4.2",
     "pytest>=9.0.2",
+    # Training dependencies
+    "accelerate>=1.0.0",
+    "peft>=0.10.0",
+    "tensorboard>=2.15.0",
 ]
