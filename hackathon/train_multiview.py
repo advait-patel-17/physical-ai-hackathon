@@ -19,16 +19,17 @@ Hyperparameters (from plan):
 - LR schedule: Constant (after warmup)
 
 Usage:
-    # Single GPU with gradient accumulation
+    # Single GPU
     python train_multiview.py \
         --dataset_path /path/to/dataset \
         --batch_size 8 \
-        --gradient_accumulation_steps 8
+        --global_batch_size 64
     
-    # Multi-GPU with accelerate
+    # Multi-GPU with accelerate (4 GPUs)
     accelerate launch --num_processes 4 train_multiview.py \
         --dataset_path /path/to/dataset \
-        --batch_size 16
+        --batch_size 16 \
+        --global_batch_size 64
 """
 
 import argparse
@@ -361,10 +362,10 @@ def parse_args():
         help="Per-device batch size",
     )
     parser.add_argument(
-        "--gradient_accumulation_steps",
+        "--global_batch_size",
         type=int,
-        default=8,
-        help="Gradient accumulation steps (effective batch = batch_size * num_gpus * grad_accum)",
+        default=64,
+        help="Global batch size (must be divisible by batch_size * num_gpus)",
     )
     parser.add_argument(
         "--lr",
@@ -474,9 +475,22 @@ def parse_args():
 def main():
     args = parse_args()
     
+    # Calculate gradient accumulation steps from global batch size
+    # We need to know num_processes before creating accelerator, so use env var or default to 1
+    num_processes = int(os.environ.get("WORLD_SIZE", 1))
+    
+    per_device_total = args.batch_size * num_processes
+    if args.global_batch_size % per_device_total != 0:
+        raise ValueError(
+            f"global_batch_size ({args.global_batch_size}) must be divisible by "
+            f"batch_size ({args.batch_size}) * num_gpus ({num_processes}) = {per_device_total}"
+        )
+    
+    gradient_accumulation_steps = args.global_batch_size // per_device_total
+    
     # Initialize accelerator with wandb
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with="wandb",
         project_dir=args.output_dir,
@@ -501,8 +515,9 @@ def main():
         print(f"  Weight decay: {args.weight_decay}")
         print(f"  Gradient clipping: {args.grad_clip}")
         print(f"  Per-device batch size: {args.batch_size}")
-        print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
-        print(f"  Effective batch size: {args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
+        print(f"  Global batch size: {args.global_batch_size}")
+        print(f"  Gradient accumulation: {gradient_accumulation_steps} (computed)")
+        print(f"  Effective batch size: {args.global_batch_size}")
         print(f"  LoRA rank: {args.lora_r}")
         print(f"  LoRA alpha: {args.lora_alpha}")
         print(f"  Mixed precision: {args.mixed_precision}")
@@ -632,7 +647,8 @@ def main():
                 "weight_decay": args.weight_decay,
                 "grad_clip": args.grad_clip,
                 "batch_size": args.batch_size,
-                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "global_batch_size": args.global_batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
                 "lora_r": args.lora_r,
                 "lora_alpha": args.lora_alpha,
                 "model_name": args.model_name,
