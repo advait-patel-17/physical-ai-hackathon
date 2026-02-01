@@ -300,7 +300,7 @@ class MultiviewCosmosWrapper(nn.Module):
         self.vae_temporal_compression = self.vae.config.scale_factor_temporal
         self.vae_spatial_compression = self.vae.config.scale_factor_spatial
         self.latent_channels = self.vae.config.z_dim
-        
+
         # Replace transformer's RoPE with per-view version
         # This ensures RoPE positions reset for each view instead of being continuous
         self.transformer.rope = MultiviewRotaryPosEmbed(
@@ -311,8 +311,49 @@ class MultiviewCosmosWrapper(nn.Module):
             num_views=self.num_views,
         )
         print(f"Replaced RoPE with per-view version (num_views={self.num_views})")
-        
-        
+
+        # Resize patch_embed to handle extra channels from view embeddings
+        self._resize_patch_embed_for_view_channels()
+
+    def _resize_patch_embed_for_view_channels(self):
+        """Resize patch_embed projection to handle extra channels from view embeddings.
+
+        The view embeddings add `view_embed_dim` channels to the latent input.
+        We need to expand the patch_embed.proj linear layer to accept these extra channels.
+        """
+        patch_embed = self.transformer.patch_embed
+        old_proj = patch_embed.proj
+
+        # Get patch size from config
+        patch_size = self.transformer.config.patch_size  # (t, h, w)
+        patch_volume = patch_size[0] * patch_size[1] * patch_size[2]
+
+        # Calculate new input features based on actual channel structure:
+        # VAE latent (16) + view_embed (7) + padding_mask (1) = 24 channels
+        old_in_features = old_proj.in_features
+        new_channels = self.latent_channels + self.view_embed_dim + 1  # +1 for padding_mask
+        new_in_features = new_channels * patch_volume
+
+        # Create new projection layer
+        new_proj = nn.Linear(
+            new_in_features,
+            old_proj.out_features,
+            bias=old_proj.bias is not None,
+        ).to(dtype=old_proj.weight.dtype, device=old_proj.weight.device)
+
+        # Copy original weights for the original channels
+        with torch.no_grad():
+            new_proj.weight[:, :old_in_features] = old_proj.weight
+            # Initialize new channel weights with small values
+            nn.init.normal_(new_proj.weight[:, old_in_features:], std=0.02)
+            if old_proj.bias is not None:
+                new_proj.bias.copy_(old_proj.bias)
+
+        # Replace the projection
+        patch_embed.proj = new_proj
+        print(f"Resized patch_embed: {old_in_features} -> {new_in_features} features "
+              f"({new_channels} channels: {self.latent_channels} VAE + {self.view_embed_dim} view + 1 padding)")
+
     def _apply_lora(self, r: int, alpha: int, dropout: float):
         """Apply LoRA to transformer."""
         lora_config = LoraConfig(
@@ -346,7 +387,10 @@ class MultiviewCosmosWrapper(nn.Module):
         
         # Rearrange to (B, C, T, H, W) for VAE
         video = rearrange(video, 'b t c h w -> b c t h w')
-        
+
+        # Cast to VAE dtype (typically bfloat16)
+        video = video.to(dtype=self.vae.dtype)
+
         with torch.no_grad():
             latent = self.vae.encode(video).latent_dist.sample()
         
@@ -354,13 +398,16 @@ class MultiviewCosmosWrapper(nn.Module):
     
     def decode_latent(self, latent: Tensor) -> Tensor:
         """Decode latent to video using VAE.
-        
+
         Args:
             latent: Latent tensor (B, C, T, H, W)
-            
+
         Returns:
             Video tensor (B, T, C, H, W) in [0, 1]
         """
+        # Cast to VAE dtype (typically bfloat16)
+        latent = latent.to(dtype=self.vae.dtype)
+
         with torch.no_grad():
             video = self.vae.decode(latent).sample
         
@@ -462,11 +509,17 @@ class MultiviewCosmosWrapper(nn.Module):
         # Scale timestep to [0, 1000] range expected by diffusers
         timestep_scaled = timestep * 1000.0
         
+        # Create padding mask (all ones = no padding for fixed-size videos)
+        # Shape (1, 1, H, W) so that after unsqueeze(2).repeat() it becomes (B, 1, T, H, W)
+        _, _, _, H, W = latent.shape
+        padding_mask = torch.ones(1, 1, H, W, device=latent.device, dtype=latent.dtype)
+
         # Forward through transformer
         output = self.transformer(
             hidden_states=latent,
             timestep=timestep_scaled,
             encoder_hidden_states=text_embeds,
+            padding_mask=padding_mask,
             return_dict=False,
         )[0]
         
