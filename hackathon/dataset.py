@@ -2,7 +2,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
 import os
-g
+
 import numpy as np
 import pandas as pd
 import torch
